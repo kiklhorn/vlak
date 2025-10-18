@@ -17,94 +17,80 @@ import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.text.Charsets.UTF_8
 
-// Enum (výčtový typ) pro jednoduché a bezpečné uchování stavu pohybu vlaku.
-// Použití enumu zabraňuje chybám z překlepů, které by mohly nastat při použití obyčejných stringů.
 enum class TrainState {
     FORWARD,
     BACKWARD,
     STOPPED
 }
 
-// @SuppressLint("MissingPermission") je zde použit, protože oprávnění jsou kontrolována a vyžadována
-// v MainActivity dříve, než jsou volány metody tohoto ViewModelu.
 @SuppressLint("MissingPermission")
-// VlakViewModel dědí z AndroidViewModel, protože potřebujeme přístup k aplikačnímu kontextu
-// pro získání systémových služeb jako je BluetoothManager.
 class VlakViewModel(application: Application) : AndroidViewModel(application) {
 
-    // --- Stavové proměnné pro UI --- //
-    // _connected je privátní MutableStateFlow, který uchovává interní stav připojení (true/false).
+    // --- Stavové proměnné pro UI ---
     private val _connected = MutableStateFlow(false)
-    val connected = _connected.asStateFlow() // Veřejná, neměnitelná verze pro UI.
+    val connected = _connected.asStateFlow()
+
+    private val _isSynced = MutableStateFlow(false)
+    val isSynced = _isSynced.asStateFlow()
 
     private val _speed = MutableStateFlow(50f)
     val speed = _speed.asStateFlow()
 
-    // Stav informující UI, zda právě probíhá skenování zařízení.
     private val _isScanning = MutableStateFlow(false)
     val isScanning = _isScanning.asStateFlow()
 
-    // Seznam nalezených BLE zařízení, který se zobrazí v dialogu.
     private val _discoveredDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
     val discoveredDevices = _discoveredDevices.asStateFlow()
 
-    // Uchovává aktuální stav pohybu vlaku (STOPPED, FORWARD, BACKWARD).
     private val _trainState = MutableStateFlow(TrainState.STOPPED)
     val trainState = _trainState.asStateFlow()
 
-    // --- Bluetooth proměnné a konstanty --- //
+    private val _microsteps = MutableStateFlow(4)
+    val microsteps = _microsteps.asStateFlow()
+
+    // --- Bluetooth proměnné a konstanty ---
     private val serviceUuid: UUID = UUID.fromString("d1f61c9f-6eef-4911-8b49-98e13dd94938")
-    private val characteristicUuid: UUID = UUID.fromString("abd41953-43f6-426c-b9d3-ff151d71b489")
+    private val commandCharUuid: UUID = UUID.fromString("abd41953-43f6-426c-b9d3-ff151d71b489")
+    private val stateCharUuid: UUID = UUID.fromString("c3413c66-4001-42e3-a553-064950de6833")
+    private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
     private var bluetoothGatt: BluetoothGatt? = null
+
+    // --- Architektura: Příkazová fronta ---
+    private val commandQueue = ConcurrentLinkedQueue<ByteArray>()
+    private val isWriting = AtomicBoolean(false)
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (getApplication<Application>().getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     }
 
-    // --- Veřejné funkce volané z UI --- //
-    fun setSpeed(value: Float) {
-        _speed.value = value
-        sendSpeed(value)
-    }
-
     // --- Logika skenování a připojování --- //
-
-    // Spustí skenování BLE zařízení.
     fun startScan() {
         if (!hasRequiredBluetoothPermissions()) return
-
-        _discoveredDevices.value = emptyList() // Vyčistí seznam od předchozího skenování.
-        _isScanning.value = true // Informuje UI, že skenování začalo.
-
-        // Vytvoříme filtr, který bude hledat pouze zařízení inzerující naši specifickou službu (serviceUuid).
-        val scanFilter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(serviceUuid))
-            .build()
-        // Nastavení skenování pro nízkou latenci (rychlejší odezva).
-        val scanSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
+        _discoveredDevices.value = emptyList()
+        _isScanning.value = true
+        val scanFilter = ScanFilter.Builder().setServiceUuid(ParcelUuid(serviceUuid)).build()
+        val scanSettings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         bluetoothAdapter?.bluetoothLeScanner?.startScan(listOf(scanFilter), scanSettings, leScanCallback)
     }
 
-    // Zastaví probíhající skenování.
     fun stopScan() {
-        _isScanning.value = false // Informuje UI, že skenování skončilo.
+        _isScanning.value = false
         bluetoothAdapter?.bluetoothLeScanner?.stopScan(leScanCallback)
     }
 
-    // Připojí se k zařízení, které si uživatel vybral v dialogu.
     fun connectToDevice(device: BluetoothDevice) {
-        stopScan() // Vždy zastavíme skenování před pokusem o připojení.
+        stopScan()
         device.connectGatt(getApplication(), false, gattCallback)
     }
 
     private val leScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             result?.device?.let { device ->
-                // Zabrání duplicitám v seznamu. Přidá zařízení, pouze pokud v seznamu ještě není (podle MAC adresy).
                 if (device.name != null && _discoveredDevices.value.none { it.address == device.address }) {
                     _discoveredDevices.value = _discoveredDevices.value + device
                 }
@@ -117,55 +103,146 @@ class VlakViewModel(application: Application) : AndroidViewModel(application) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 bluetoothGatt = gatt
                 _connected.value = true
-                _discoveredDevices.value = emptyList() // Po připojení vyčistíme seznam, už ho nepotřebujeme.
-                gatt?.discoverServices()
+                _discoveredDevices.value = emptyList()
+                commandQueue.clear()
+                isWriting.set(false)
+                gatt?.requestMtu(67)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 disconnectBLE()
             }
         }
-        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {}
+
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            gatt?.discoverServices()
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+            val service = gatt?.getService(serviceUuid)
+            val stateChar = service?.getCharacteristic(stateCharUuid)
+            gatt?.setCharacteristicNotification(stateChar, true)
+
+            val descriptor = stateChar?.getDescriptor(CCCD_UUID)
+            descriptor?.let { desc ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt?.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    @Suppress("DEPRECATION")
+                    gatt?.writeDescriptor(desc)
+                }
+            }
+        }
+        
+        override fun onCharacteristicWrite(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                isWriting.set(false)
+                processCommandQueue()
+            }
+        }
+
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && characteristic.uuid == stateCharUuid) {
+                @Suppress("DEPRECATION")
+                parseAndApplyState(characteristic.getStringValue(0))
+            }
+        }
+        
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            if (characteristic.uuid == stateCharUuid) {
+                parseAndApplyState(value.toString(UTF_8))
+            }
+        }
     }
 
     fun disconnectBLE() {
+        commandQueue.clear()
+        isWriting.set(false)
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
         _connected.value = false
-        _trainState.value = TrainState.STOPPED // Po odpojení vždy resetujeme stav vlaku na "zastavený".
-    }
-
-    // --- Odesílací funkce --- //
-    // Každá z těchto funkcí nejprve odešle příkaz přes BLE a poté aktualizuje interní stav `_trainState`.
-    fun sendForward() {
-        writeStringToCharacteristic("FORWARD")
-        _trainState.value = TrainState.FORWARD
-    }
-
-    fun sendBackward() {
-        writeStringToCharacteristic("BACKWARD")
-        _trainState.value = TrainState.BACKWARD
-    }
-
-    fun sendStop() {
-        writeStringToCharacteristic("STOP")
+        _isSynced.value = false 
         _trainState.value = TrainState.STOPPED
     }
 
-    fun sendMicrosteps(steps: Int) = writeStringToCharacteristic("MICROSTEPS:$steps")
-    private fun sendSpeed(speed: Float) = writeStringToCharacteristic("SPEED:${speed.toInt()}")
+    // --- Logika odesílání přes frontu ---
+    private fun sendCommand(command: String) {
+        commandQueue.offer(command.toByteArray(UTF_8))
+        processCommandQueue()
+    }
 
-    private fun writeStringToCharacteristic(value: String) {
-        val service = bluetoothGatt?.getService(serviceUuid)
-        val charac = service?.getCharacteristic(characteristicUuid)
-        if (charac != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                bluetoothGatt?.writeCharacteristic(charac, value.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+    private fun processCommandQueue() {
+        if (isWriting.get() || commandQueue.isEmpty()) {
+            return
+        }
+
+        val data = commandQueue.poll()
+        if (data != null) {
+            isWriting.set(true)
+            val service = bluetoothGatt?.getService(serviceUuid)
+            val charac = service?.getCharacteristic(commandCharUuid)
+            if (charac != null) {
+                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    bluetoothGatt?.writeCharacteristic(charac, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } else {
+                    @Suppress("DEPRECATION")
+                    charac.value = data
+                    @Suppress("DEPRECATION")
+                    bluetoothGatt?.writeCharacteristic(charac)
+                }
             } else {
-                @Suppress("DEPRECATION")
-                charac.value = value.toByteArray()
-                @Suppress("DEPRECATION")
-                bluetoothGatt?.writeCharacteristic(charac)
+                isWriting.set(false)
             }
+        }
+    }
+
+    // --- Veřejné funkce pro ovládání ---
+    fun sendForward() = sendCommand("FORWARD")
+    fun sendBackward() = sendCommand("BACKWARD")
+    fun sendStop() = sendCommand("STOP")
+    fun sendMicrosteps(steps: Int) = sendCommand("MICROSTEPS:$steps")
+    fun setSpeed(value: Float) {
+        _speed.value = value
+        sendCommand("SPEED:${value.toInt()}")
+    }
+    fun sendHornOn() = sendCommand("HORN_ON")
+    fun sendHornOff() = sendCommand("HORN_OFF")
+    
+    // Prioritní příkaz nouzové brzdy
+    fun sendEmergencyStop() {
+        commandQueue.clear() // Vymaže všechny čekající příkazy
+        sendCommand("E_STOP") // Pošle nouzový příkaz
+    }
+
+    private fun parseAndApplyState(stateString: String?) {
+        if (stateString == null) return
+
+        val parts = stateString.trim().split(";")
+        parts.forEach { part ->
+            if (part.contains(":")) {
+                val key = part.substringBefore(":")
+                val value = part.substringAfter(":")
+                when (key) {
+                    "STATE" -> {
+                        when (value) {
+                            "FORWARD" -> _trainState.value = TrainState.FORWARD
+                            "BACKWARD" -> _trainState.value = TrainState.BACKWARD
+                            "STOPPED" -> _trainState.value = TrainState.STOPPED
+                        }
+                    }
+                    "SPEED" -> {
+                        value.toIntOrNull()?.let { _speed.value = it.toFloat() }
+                    }
+                    "MICROSTEPS" -> {
+                        value.toIntOrNull()?.let { _microsteps.value = it }
+                    }
+                }
+            }
+        }
+        
+        if (!_isSynced.value) {
+            _isSynced.value = true
         }
     }
 
@@ -179,11 +256,11 @@ class VlakViewModel(application: Application) : AndroidViewModel(application) {
         val context = getApplication<Application>()
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED &&
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         }
     }
 }

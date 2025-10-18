@@ -302,9 +302,9 @@ void logMovementInfo() {
   float steps_per_motor_rev = 360.0 / MOTOR_STEP_ANGLE;
   float microsteps_per_wheel_rev = steps_per_motor_rev * GEAR_RATIO * currentMicrosteps;
   float steps_per_second = 1000000.0 / currentSpeedDelay;
-  float wheel_rpm = (steps_per_second / microsteps_per_wheel_rev) * 60.0;
+  float wheel_rpm = (steps_per_second / microsteps_per_wheel_rev) * 60.0 / GEAR_RATIO;
   float wheel_circumference_mm = WHEEL_DIAMETER_MM * PI;
-  float speed_cm_per_second = (steps_per_second / microsteps_per_wheel_rev) * wheel_circumference_mm / 10.0;
+  float speed_cm_per_second = wheel_rpm * wheel_circumference_mm / 60.0 / 10.0;
 
   Serial.println(F("--- Info o pohybu ---"));
   Serial.print(F("  Otáčky kola (RPM): ")); Serial.println(wheel_rpm);

@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.vlak.ui.theme.VLAKTheme
+import java.util.Locale
 
 @SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
@@ -99,6 +100,8 @@ fun TrainControlContent(viewModel: VlakViewModel, onShowDeviceDialog: () -> Unit
     val speed by viewModel.speed.collectAsState()
     val trainState by viewModel.trainState.collectAsState()
     val microsteps by viewModel.microsteps.collectAsState()
+    val speedCms by viewModel.speedCms.collectAsState()
+    val rpm by viewModel.rpm.collectAsState()
 
     var microstepsExpanded by remember { mutableStateOf(false) }
     val microstepsOptions = listOf(1, 2, 4, 8, 16, 32)
@@ -110,7 +113,7 @@ fun TrainControlContent(viewModel: VlakViewModel, onShowDeviceDialog: () -> Unit
             .verticalScroll(rememberScrollState()) // Toto umožňuje rolování
             .padding(8.dp)
             // Přidáme spodní padding, aby obsah nezajížděl pod E-STOP tlačítko
-            .padding(bottom = 120.dp), 
+            .padding(bottom = 120.dp),
         verticalArrangement = Arrangement.Top
     ) {
         Box(
@@ -171,7 +174,18 @@ fun TrainControlContent(viewModel: VlakViewModel, onShowDeviceDialog: () -> Unit
             // Tento řádek byl odstraněn, protože tlačítko Microsteps je nyní nahoře
 
             Spacer(Modifier.height(8.dp))
-            Text("Rychlost:")
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Rychlost:")
+                Text(
+                    text = String.format(Locale.US, "%.2f cm/s | %.2f RPM", speedCms, rpm),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
             Slider(
                 value = speed,
                 onValueChange = { viewModel.setSpeed(it) },

@@ -52,6 +52,12 @@ class VlakViewModel(application: Application) : AndroidViewModel(application) {
     private val _microsteps = MutableStateFlow(4)
     val microsteps = _microsteps.asStateFlow()
 
+    private val _speedCms = MutableStateFlow(0f)
+    val speedCms = _speedCms.asStateFlow()
+
+    private val _rpm = MutableStateFlow(0f)
+    val rpm = _rpm.asStateFlow()
+
     // --- Bluetooth proměnné a konstanty ---
     private val serviceUuid: UUID = UUID.fromString("d1f61c9f-6eef-4911-8b49-98e13dd94938")
     private val commandCharUuid: UUID = UUID.fromString("abd41953-43f6-426c-b9d3-ff151d71b489")
@@ -224,18 +230,24 @@ class VlakViewModel(application: Application) : AndroidViewModel(application) {
                 val key = part.substringBefore(":")
                 val value = part.substringAfter(":")
                 when (key) {
-                    "STATE" -> {
+                    "S" -> {
                         when (value) {
-                            "FORWARD" -> _trainState.value = TrainState.FORWARD
-                            "BACKWARD" -> _trainState.value = TrainState.BACKWARD
-                            "STOPPED" -> _trainState.value = TrainState.STOPPED
+                            "F" -> _trainState.value = TrainState.FORWARD
+                            "B" -> _trainState.value = TrainState.BACKWARD
+                            "S" -> _trainState.value = TrainState.STOPPED
                         }
                     }
-                    "SPEED" -> {
+                    "SP" -> {
                         value.toIntOrNull()?.let { _speed.value = it.toFloat() }
                     }
-                    "MICROSTEPS" -> {
+                    "MS" -> {
                         value.toIntOrNull()?.let { _microsteps.value = it }
+                    }
+                    "SC" -> {
+                        value.toFloatOrNull()?.let { _speedCms.value = it }
+                    }
+                    "RPM" -> {
+                        value.toFloatOrNull()?.let { _rpm.value = it }
                     }
                 }
             }

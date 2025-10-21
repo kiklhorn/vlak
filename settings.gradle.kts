@@ -21,3 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "VLAK"
 include(":app")
+include(":helpcode")

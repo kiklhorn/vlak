@@ -1,4 +1,5 @@
 #include <ArduinoBLE.h>
+#include <NRF52_MBED_TimerInterrupt.h>
 
 // ====================================================================
 //  ABSTRAKCE HARDWARU (VÝBĚR DESKY)
@@ -40,6 +41,12 @@
 #define GEAR_RATIO          21.0  
 #define WHEEL_DIAMETER_MM   25.0  
 
+// --- Limity hardwaru ---
+#define MOTOR_MIN_FULL_STEPS_PER_SEC 20
+#define MOTOR_MAX_FULL_STEPS_PER_SEC 2400
+#define MAX_TIMER_FREQ 100000.0f
+// Reálný čas (v us), který procesor stráví v ISR. Odvozeno z měření.
+#define ISR_OVERHEAD_US 7
 
 // --- UUIDs --- 
 #define SERVICE_UUID        "d1f61c9f-6eef-4911-8b49-98e13dd94938"
@@ -50,41 +57,55 @@ BLEService trainService(SERVICE_UUID);
 BLECharacteristic commandChar(COMMAND_CHAR_UUID, BLEWrite, 32);
 BLECharacteristic stateChar(STATE_CHAR_UUID, BLERead | BLENotify, 64);
 
+// --- Timer pro generování pulzů ---
+NRF52_MBED_Timer ITimer(NRF_TIMER_1);
+
 // --- Stavy systému a motoru ---
 enum SystemState { NORMAL, EMERGENCY_STOP };
 SystemState systemState = NORMAL;
 enum MotorState { STOPPED, FORWARD, BACKWARD };
-MotorState currentMotorState = STOPPED;
+volatile MotorState currentMotorState = STOPPED;
 
 // --- Proměnné pro řízení pohybu a stavů ---
-volatile unsigned long lastStepTime = 0;
-int currentSpeedDelay = 2000;  
-int currentMicrosteps = 4;
+int currentSpeedDelay = 50000;
+int userRequestedMicrosteps = 32;
+int activeMicrosteps = 32;
 int currentSpeed = 50;         
-
-// Základní prodlevy pro plný krok (1 microstep) - Kalibrováno na 70 RPM
-// POZNÁMKA: Tyto hodnoty budou nyní přepočítány v calculateSpeedDelay()
-#define BASE_DELAY_MAX 2000 
-#define BASE_DELAY_MIN 50
 
 // Proměnné pro E-STOP
 unsigned long emergencyStopTime = 0;
 MotorState directionBeforeEmergency = STOPPED;
 unsigned long lastBlinkTime = 0;
 
+struct MovementInfo {
+  float wheel_rpm;
+  float speed_cm_per_second;
+};
+
 // --- Deklarace funkcí ---
 void onCommandWritten(BLEDevice central, BLECharacteristic characteristic);
 void onBleConnected(BLEDevice central, BLECharacteristic characteristic);
-void setMicrostepMode(uint8_t microstep, bool save);
+void setMicrostepPins(uint8_t microstep);
 void updateAndNotifyState();
 void loadSettings();
 void saveSettings();
 void calculateSpeedDelay();
 void logMovementInfo();
+MovementInfo calculateMovementInfo();
+
+// ISR - Interrupt Service Routine
+void TimerHandler() {
+  if (currentMotorState != STOPPED) {
+    digitalWrite(STEP_PIN, !digitalRead(STEP_PIN));
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("BLE Vlak Server - Start (v11, oprava pulzů)");
+  unsigned long start_time = millis();
+  while (!Serial && (millis() - start_time < 2000));
+  
+  Serial.println("BLE Vlak Server - Start (v25-full-data)");
 
   loadSettings();
 
@@ -96,14 +117,22 @@ void setup() {
   digitalWrite(DIR_PIN, LOW);
   digitalWrite(SLEEP_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
-  setMicrostepMode(currentMicrosteps, false);
+  
+  setMicrostepPins(userRequestedMicrosteps);
   calculateSpeedDelay();
+  
+  if (ITimer.attachInterruptInterval(currentSpeedDelay, TimerHandler)) {
+    Serial.println("Časovač pro motor úspěšně nastaven.");
+  } else {
+    Serial.println("Chyba: Nepodařilo se nastavit časovač pro motor!");
+  }
+  ITimer.disableTimer();
 
   if (!BLE.begin()) {
     Serial.println("Chyba: BLE nelze inicializovat!");
     while (1);
   }
-  BLE.setLocalName("TrainBLE");
+  BLE.setLocalName("VlakBezHW");
   BLE.setAdvertisedService(trainService);
   trainService.addCharacteristic(commandChar);
   trainService.addCharacteristic(stateChar);
@@ -118,41 +147,14 @@ void setup() {
 
 void loop() {
   BLE.poll();
-
   if (systemState == EMERGENCY_STOP) {
-    unsigned long timeSinceEmergency = millis() - emergencyStopTime;
-
-    if (directionBeforeEmergency != STOPPED && timeSinceEmergency < 1000) {
-      // Fáze protipohybu - používáme stejnou prodlevu jako pro normální pohyb
-      if (micros() - lastStepTime >= currentSpeedDelay) { 
-        lastStepTime = micros();
-        // Generujeme jeden krok (změna stavu pinů)
-        digitalWrite(STEP_PIN, HIGH);
-        delayMicroseconds(5);
-        digitalWrite(STEP_PIN, LOW);
-      }
-    } else {
-      // Fáze držení motoru a blikání
-      if (timeSinceEmergency >= 5000 && digitalRead(SLEEP_PIN) == HIGH) {
-          Serial.println("E-Stop: 5s timeout. Uvolňuji motor.");
-          digitalWrite(SLEEP_PIN, LOW);
-      }
-      if (millis() - lastBlinkTime > 250) { 
-        lastBlinkTime = millis();
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      }
+    if (millis() - emergencyStopTime >= 5000 && digitalRead(SLEEP_PIN) == HIGH) {
+        Serial.println("E-Stop: 5s timeout. Uvolňuji motor.");
+        digitalWrite(SLEEP_PIN, LOW);
     }
-
-  } else { // systemState == NORMAL
-    if (currentMotorState != STOPPED) {
-      // --- SPRÁVNÁ LOGIKA GENEROVÁNÍ PULZU ---
-      if (micros() - lastStepTime >= currentSpeedDelay) {
-        lastStepTime = micros(); // Aktualizujeme čas posledního kroku
-        // Generujeme jeden krok: PŘEKLOOPENÍ STAVU PINU STEP
-        digitalWrite(STEP_PIN, HIGH);
-        delayMicroseconds(3);
-        digitalWrite(STEP_PIN, LOW);
-      }
+    if (millis() - lastBlinkTime > 250) { 
+      lastBlinkTime = millis();
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     }
   }
 }
@@ -172,16 +174,12 @@ void onCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
   if (cmd == "E_STOP") {
     if (systemState != EMERGENCY_STOP) {
       Serial.println("NOUZOVÁ BRZDA AKTIVOVÁNA!");
-      directionBeforeEmergency = currentMotorState;
-      bool stateChanged = (currentMotorState != STOPPED);
+      ITimer.disableTimer();
       currentMotorState = STOPPED;
       systemState = EMERGENCY_STOP;
       emergencyStopTime = millis();
       digitalWrite(SLEEP_PIN, HIGH);
-      delay(2);
-      if (directionBeforeEmergency == FORWARD) { digitalWrite(DIR_PIN, LOW); }
-      else if (directionBeforeEmergency == BACKWARD) { digitalWrite(DIR_PIN, HIGH); }
-      if (stateChanged) { updateAndNotifyState(); }
+      updateAndNotifyState();
     }
     return;
   }
@@ -190,6 +188,7 @@ void onCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
     Serial.println("Nouzový stav zrušen.");
     systemState = NORMAL;
     digitalWrite(LED_PIN, LOW);
+    updateAndNotifyState();
   }
 
   bool stateChanged = false;
@@ -200,6 +199,7 @@ void onCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
       digitalWrite(SLEEP_PIN, HIGH); delay(2);
       digitalWrite(DIR_PIN, HIGH);
       currentMotorState = FORWARD;
+      ITimer.enableTimer();
       stateChanged = true;
       movementCommand = true;
     }
@@ -208,24 +208,30 @@ void onCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
       digitalWrite(SLEEP_PIN, HIGH); delay(2);
       digitalWrite(DIR_PIN, LOW);
       currentMotorState = BACKWARD;
+      ITimer.enableTimer();
       stateChanged = true;
       movementCommand = true;
     }
   } else if (cmd == "STOP") {
-    stateChanged = (currentMotorState != STOPPED);
-    currentMotorState = STOPPED;
-    digitalWrite(SLEEP_PIN, LOW);
-    movementCommand = true;
+    if (currentMotorState != STOPPED) {
+        ITimer.disableTimer();
+        currentMotorState = STOPPED;
+        digitalWrite(STEP_PIN, LOW);
+        digitalWrite(SLEEP_PIN, LOW);
+        stateChanged = true;
+        movementCommand = true;
+    }
   } else if (cmd.startsWith("SPEED:")) {
     currentSpeed = cmd.substring(6).toInt();
     calculateSpeedDelay();
+    updateAndNotifyState(); 
     movementCommand = true;
   } else if (cmd.startsWith("MICROSTEPS:")) {
-    int microstepsValue = cmd.substring(11).toInt();
-    if (microstepsValue != currentMicrosteps) {
-        setMicrostepMode(microstepsValue, true);
-        stateChanged = true;
-    }
+    userRequestedMicrosteps = cmd.substring(11).toInt();
+    saveSettings();
+    calculateSpeedDelay();
+    stateChanged = true;
+    movementCommand = true; // Přidáno pro logování
   } else if (cmd == "HORN_ON") {
     digitalWrite(LED_PIN, HIGH);
   } else if (cmd == "HORN_OFF") {
@@ -241,20 +247,35 @@ void onCommandWritten(BLEDevice central, BLECharacteristic characteristic) {
 }
 
 void calculateSpeedDelay() {
-  int baseDelay = map(currentSpeed, 0, 100, BASE_DELAY_MAX, BASE_DELAY_MIN);
-  currentSpeedDelay = baseDelay / currentMicrosteps;
-  
-  if (currentSpeedDelay < 3) { 
-    currentSpeedDelay = 3;
+  if (currentSpeed == 0) {
+    ITimer.setInterval(1000000, TimerHandler);
+    return;
   }
-  Serial.print("Nová finální prodleva: "); Serial.println(currentSpeedDelay);
+
+  long target_full_steps_freq = map(currentSpeed, 1, 100, MOTOR_MIN_FULL_STEPS_PER_SEC, MOTOR_MAX_FULL_STEPS_PER_SEC);
+
+  int newMicrosteps = userRequestedMicrosteps;
+  while ((target_full_steps_freq * newMicrosteps * 2) > MAX_TIMER_FREQ && newMicrosteps > 1) {
+    newMicrosteps /= 2;
+  }
+
+  if (newMicrosteps != activeMicrosteps) {
+    activeMicrosteps = newMicrosteps;
+    Serial.print("Dynamicky měním microsteps na: "); Serial.println(activeMicrosteps);
+    setMicrostepPins(activeMicrosteps);
+  }
+
+  long timer_freq = (long)target_full_steps_freq * activeMicrosteps * 2;
+  currentSpeedDelay = 1000000L / timer_freq;
+  
+  ITimer.setInterval(currentSpeedDelay, TimerHandler);
+  
+  Serial.print("Nová prodleva časovače (us): "); Serial.println(currentSpeedDelay);
 }
 
-void setMicrostepMode(uint8_t microstep, bool save) {
-  currentMicrosteps = microstep;
+void setMicrostepPins(uint8_t microstep) {
   pinMode(M0_PIN, OUTPUT);
   pinMode(M1_PIN, OUTPUT);
-
   switch (microstep) {
     case 1:   digitalWrite(M0_PIN, LOW);  digitalWrite(M1_PIN, LOW);  break;
     case 2:   digitalWrite(M0_PIN, HIGH); digitalWrite(M1_PIN, LOW);  break;
@@ -264,72 +285,78 @@ void setMicrostepMode(uint8_t microstep, bool save) {
     case 32:  pinMode(M0_PIN, INPUT);     digitalWrite(M1_PIN, HIGH); break;
     default:  pinMode(M0_PIN, INPUT);     digitalWrite(M1_PIN, LOW);  break;
   }
+}
 
-  calculateSpeedDelay(); 
-  logMovementInfo();
+MovementInfo calculateMovementInfo() {
+  MovementInfo info = {0.0, 0.0};
+  if (currentMotorState == STOPPED || currentSpeed == 0) return info;
 
-  if (save) {
-    saveSettings();
-  }
+  // Zohledníme reálný čas vykonání ISR
+  long real_delay = max(currentSpeedDelay, ISR_OVERHEAD_US);
+
+  float pulse_freq = (1000000.0 / real_delay) / 2.0;
+  float steps_per_motor_rev = 360.0 / MOTOR_STEP_ANGLE;
+  float microsteps_per_motor_rev = steps_per_motor_rev * activeMicrosteps;
+  
+  info.wheel_rpm = (pulse_freq / microsteps_per_motor_rev) / GEAR_RATIO * 60.0;
+  
+  float wheel_circumference_mm = WHEEL_DIAMETER_MM * PI;
+  info.speed_cm_per_second = (info.wheel_rpm * wheel_circumference_mm) / 60.0 / 10.0;
+  
+  return info;
 }
 
 void updateAndNotifyState() {
-  String stateString = "";
-  stateString += "STATE:";
-  if (currentMotorState == FORWARD) stateString += "FORWARD";
-  else if (currentMotorState == BACKWARD) stateString += "BACKWARD";
-  else stateString += "STOPPED";
+  String stateString = "S:";
+  if (currentMotorState == FORWARD) stateString += "F";
+  else if (currentMotorState == BACKWARD) stateString += "B";
+  else stateString += "S";
   
-  stateString += ";";
-  stateString += "SPEED:";
+  stateString += ";SP:";
   stateString += currentSpeed;
-  stateString += ";";
-  stateString += "MICROSTEPS:";
-  stateString += currentMicrosteps;
+  stateString += ";MS:";
+  stateString += activeMicrosteps;
 
-  Serial.print("Odesílám stav: ");
-  Serial.println(stateString);
-  
+  MovementInfo info = calculateMovementInfo();
+  stateString += ";SC:";
+  stateString += String(info.speed_cm_per_second, 2);
+  stateString += ";RPM:";
+  stateString += String(info.wheel_rpm, 2);
+
+  Serial.print("Odesílám stav: "); Serial.println(stateString);
   stateChar.writeValue(stateString.c_str());
 }
 
 void logMovementInfo() {
-  if (currentMotorState == STOPPED) {
+  if (currentMotorState == STOPPED || currentSpeed == 0) {
     Serial.println("-> Vlak stojí.");
     return;
   }
-
-  float steps_per_motor_rev = 360.0 / MOTOR_STEP_ANGLE;
-  float microsteps_per_wheel_rev = steps_per_motor_rev * GEAR_RATIO * currentMicrosteps;
-  float steps_per_second = 1000000.0 / currentSpeedDelay;
-  float wheel_rpm = (steps_per_second / microsteps_per_wheel_rev) * 60.0 / GEAR_RATIO;
-  float wheel_circumference_mm = WHEEL_DIAMETER_MM * PI;
-  float speed_cm_per_second = wheel_rpm * wheel_circumference_mm / 60.0 / 10.0;
-
-  Serial.println(F("--- Info o pohybu ---"));
-  Serial.print(F("  Otáčky kola (RPM): ")); Serial.println(wheel_rpm);
-  Serial.print(F("  Rychlost (cm/s): ")); Serial.println(speed_cm_per_second);
-  Serial.println(F("---------------------"));
+  MovementInfo info = calculateMovementInfo();
+  Serial.println(F("--- Info o pohybu (Realtime) ---"));
+  Serial.print(F("  Otáčky kola (RPM): ")); Serial.println(info.wheel_rpm, 2);
+  Serial.print(F("  Rychlost (cm/s): ")); Serial.println(info.speed_cm_per_second, 2);
+  Serial.println(F("--------------------------------"));
 }
 
-// --- Funkce pro ukládání / načítání ---
 #if defined(ARDUINO_ARDUINO_NANO33BLE) || defined(ARDUINO_NANO33BLE_SENSE)
 void loadSettings() { 
   int storedValue;
   EEPROM.get(EEPROM_ADDR_MICROSTEPS, storedValue);
-  if (storedValue == 1 || storedValue == 2 || storedValue == 4 || storedValue == 8 || storedValue == 16 || storedValue == 32) {
-    currentMicrosteps = storedValue;
-    Serial.println("Načteno z EEPROM: " + String(currentMicrosteps));
+  if (storedValue >= 1 && storedValue <= 32) {
+    userRequestedMicrosteps = storedValue;
+    activeMicrosteps = userRequestedMicrosteps;
+    Serial.println("Načteno z EEPROM: " + String(userRequestedMicrosteps));
   } else {
-    Serial.println("Nenalezeno platné nastavení v EEPROM, výchozí: 4");
-    currentMicrosteps = 4;
+    Serial.println("Nenalezeno platné nastavení v EEPROM, výchozí: 32");
+    userRequestedMicrosteps = 32;
+    activeMicrosteps = 32;
   }
 }
 void saveSettings() {
-  Serial.println("Ukládám do EEPROM: " + String(currentMicrosteps));
-  EEPROM.put(EEPROM_ADDR_MICROSTEPS, currentMicrosteps);
+  Serial.println("Ukládám do EEPROM: " + String(userRequestedMicrosteps));
+  EEPROM.put(EEPROM_ADDR_MICROSTEPS, userRequestedMicrosteps);
 }
-
 #elif defined(ADAFRUIT_FEATHER_NRF52840_EXPRESS) || defined(ADAFRUIT_FEATHER_NRF52840_SENSE) || \
       defined(ADAFRUIT_CLUE_NRF52840_EXPRESS)  || defined(ADAFRUIT_NRF52840_ITSYBITSY)   || \
       defined(SPARKFUN_PRO_NRF52840_MINI)      || defined(SEEED_XIAO_NRF52840)
@@ -338,13 +365,15 @@ void loadSettings() {
   if (InternalFS.exists(SETTINGS_FILENAME)) {
     File settingsFile = InternalFS.open(SETTINGS_FILENAME, FILE_READ);
     if (settingsFile && settingsFile.available()) {
-      currentMicrosteps = settingsFile.parseInt();
-      Serial.println("Načteno z LittleFS: " + String(currentMicrosteps));
+      userRequestedMicrosteps = settingsFile.parseInt();
+      activeMicrosteps = userRequestedMicrosteps;
+      Serial.println("Načteno z LittleFS: " + String(userRequestedMicrosteps));
     }
     settingsFile.close();
   } else {
-     Serial.println("Soubor s nastavením neexistuje, výchozí: 4");
-    currentMicrosteps = 4;
+     Serial.println("Soubor s nastavením neexistuje, výchozí: 32");
+    userRequestedMicrosteps = 32;
+    activeMicrosteps = 32;
   }
 }
 void saveSettings() {
@@ -353,9 +382,8 @@ void saveSettings() {
     Serial.println("Chyba: Nepodařilo se otevřít soubor pro uložení!");
     return;
   }
-  settingsFile.print(currentMicrosteps);
+  settingsFile.print(userRequestedMicrosteps);
   settingsFile.close();
-  Serial.println("Uloženo do LittleFS: " + String(currentMicrosteps));
+  Serial.println("Uloženo do LittleFS: " + String(userRequestedMicrosteps));
 }
-
 #endif
